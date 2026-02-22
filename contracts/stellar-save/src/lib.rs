@@ -31,7 +31,7 @@ pub mod pool;
 // Re-export for convenience
 pub use events::*;
 pub use error::{StellarSaveError, ErrorCategory, ContractResult};
-pub use group::Group;
+pub use group::{Group, GroupStatus};
 pub use contribution::ContributionRecord;
 pub use payout::PayoutRecord;
 pub use status::StatusError;
@@ -353,6 +353,103 @@ impl StellarSaveContract {
         env.storage().persistent().get(&key).unwrap_or(0)
     }
 
+    /// Allows a member to contribute to the current cycle.
+    /// 
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `group_id` - ID of the group to contribute to
+    /// * `contributor` - Address of the member making the contribution
+    /// 
+    /// # Returns
+    /// * `Ok(())` if contribution is successful
+    /// * `Err(StellarSaveError)` if validation fails
+    pub fn contribute(env: Env, group_id: u64, contributor: Address) -> Result<(), StellarSaveError> {
+        // 1. Verify caller is member
+        contributor.require_auth();
+        
+        let member_key = StorageKeyBuilder::member_profile(group_id, contributor.clone());
+        if !env.storage().persistent().has(&member_key) {
+            return Err(StellarSaveError::NotMember);
+        }
+        
+        // 2. Load group and verify it's active
+        let group_key = StorageKeyBuilder::group_data(group_id);
+        let group = env.storage()
+            .persistent()
+            .get::<_, Group>(&group_key)
+            .ok_or(StellarSaveError::GroupNotFound)?;
+        
+        let status_key = StorageKeyBuilder::group_status(group_id);
+        let status = env.storage()
+            .persistent()
+            .get::<_, GroupStatus>(&status_key)
+            .unwrap_or(GroupStatus::Pending);
+        
+        if !status.accepts_contributions() {
+            return Err(StellarSaveError::InvalidState);
+        }
+        
+        // 3. Check correct amount
+        let amount = group.contribution_amount;
+        if amount <= 0 {
+            return Err(StellarSaveError::InvalidAmount);
+        }
+        
+        // 4. Check not already contributed this cycle
+        let cycle = group.current_cycle;
+        let contrib_key = StorageKeyBuilder::contribution_individual(group_id, cycle, contributor.clone());
+        if env.storage().persistent().has(&contrib_key) {
+            return Err(StellarSaveError::AlreadyContributed);
+        }
+        
+        // 5. Transfer funds to contract (placeholder - actual token transfer would go here)
+        // In production: token.transfer(&contributor, &env.current_contract_address(), &amount);
+        
+        // 6. Record contribution
+        let timestamp = env.ledger().timestamp();
+        let contribution = ContributionRecord::new(
+            contributor.clone(),
+            group_id,
+            cycle,
+            amount,
+            timestamp,
+        );
+        env.storage().persistent().set(&contrib_key, &contribution);
+        
+        // Update cycle totals
+        let total_key = StorageKeyBuilder::contribution_cycle_total(group_id, cycle);
+        let current_total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        env.storage().persistent().set(&total_key, &(current_total + amount));
+        
+        let count_key = StorageKeyBuilder::contribution_cycle_count(group_id, cycle);
+        let current_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        env.storage().persistent().set(&count_key, &(current_count + 1));
+        
+        // 7. Emit ContributionMade event
+        let cycle_total = current_total + amount;
+        EventEmitter::emit_contribution_made(
+            &env,
+            group_id,
+            contributor,
+            amount,
+            cycle,
+            cycle_total,
+            timestamp,
+        );
+        
+        // 8. Check if cycle complete
+        let new_count = current_count + 1;
+        if new_count == group.member_count {
+            // Cycle is complete - ready for payout
+            env.events().publish(
+                (Symbol::new(&env, "cycle_complete"), group_id),
+                cycle
+            );
+        }
+        
+        Ok(())
+    }
+
     /// Activates a group once minimum members have joined.
     /// 
     /// # Arguments
@@ -577,5 +674,93 @@ mod tests {
         
         let count = client.get_total_groups_created();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_contribute_success() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        let member = Address::generate(&env);
+
+        // Setup: Create a group and add member
+        let group_id = 1;
+        let group = Group::new(group_id, member.clone(), 100, 3600, 5, 2, env.ledger().timestamp());
+        env.storage().persistent().set(&StorageKeyBuilder::group_data(group_id), &group);
+        env.storage().persistent().set(&StorageKeyBuilder::group_status(group_id), &GroupStatus::Active);
+        env.storage().persistent().set(&StorageKeyBuilder::member_profile(group_id, member.clone()), &true);
+
+        // Action: Make contribution
+        env.mock_all_auths();
+        let result = client.contribute(&group_id, &member);
+        assert!(result.is_ok());
+
+        // Verify: Contribution was recorded
+        let contrib_key = StorageKeyBuilder::contribution_individual(group_id, 0, member.clone());
+        assert!(env.storage().persistent().has(&contrib_key));
+    }
+
+    #[test]
+    #[should_panic(expected = "Status(ContractError(2002))")] // NotMember
+    fn test_contribute_not_member() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        let non_member = Address::generate(&env);
+
+        // Setup: Create a group without adding the member
+        let group_id = 1;
+        let creator = Address::generate(&env);
+        let group = Group::new(group_id, creator, 100, 3600, 5, 2, env.ledger().timestamp());
+        env.storage().persistent().set(&StorageKeyBuilder::group_data(group_id), &group);
+        env.storage().persistent().set(&StorageKeyBuilder::group_status(group_id), &GroupStatus::Active);
+
+        // Action: Try to contribute as non-member
+        env.mock_all_auths();
+        client.contribute(&group_id, &non_member);
+    }
+
+    #[test]
+    #[should_panic(expected = "Status(ContractError(3002))")] // AlreadyContributed
+    fn test_contribute_already_contributed() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        let member = Address::generate(&env);
+
+        // Setup: Create a group, add member, and record a contribution
+        let group_id = 1;
+        let group = Group::new(group_id, member.clone(), 100, 3600, 5, 2, env.ledger().timestamp());
+        env.storage().persistent().set(&StorageKeyBuilder::group_data(group_id), &group);
+        env.storage().persistent().set(&StorageKeyBuilder::group_status(group_id), &GroupStatus::Active);
+        env.storage().persistent().set(&StorageKeyBuilder::member_profile(group_id, member.clone()), &true);
+        
+        let contrib = ContributionRecord::new(member.clone(), group_id, 0, 100, env.ledger().timestamp());
+        let contrib_key = StorageKeyBuilder::contribution_individual(group_id, 0, member.clone());
+        env.storage().persistent().set(&contrib_key, &contrib);
+
+        // Action: Try to contribute again
+        env.mock_all_auths();
+        client.contribute(&group_id, &member);
+    }
+
+    #[test]
+    #[should_panic(expected = "Status(ContractError(1003))")] // InvalidState
+    fn test_contribute_group_not_active() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        let member = Address::generate(&env);
+
+        // Setup: Create a group in Pending state
+        let group_id = 1;
+        let group = Group::new(group_id, member.clone(), 100, 3600, 5, 2, env.ledger().timestamp());
+        env.storage().persistent().set(&StorageKeyBuilder::group_data(group_id), &group);
+        env.storage().persistent().set(&StorageKeyBuilder::group_status(group_id), &GroupStatus::Pending);
+        env.storage().persistent().set(&StorageKeyBuilder::member_profile(group_id, member.clone()), &true);
+
+        // Action: Try to contribute while group is pending
+        env.mock_all_auths();
+        client.contribute(&group_id, &member);
     }
 }
