@@ -31,7 +31,7 @@ pub mod pool;
 // Re-export for convenience
 pub use events::*;
 pub use error::{StellarSaveError, ErrorCategory, ContractResult};
-pub use group::{Group, GroupStatus};
+pub use group::Group;
 pub use contribution::ContributionRecord;
 pub use payout::PayoutRecord;
 pub use status::StatusError;
