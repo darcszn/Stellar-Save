@@ -83,6 +83,22 @@ impl StellarSaveContract {
         
         Ok(next_id)
     }
+    /// Returns the number of members in a specific group.
+    ///
+    /// # Arguments
+    /// * `group_id` - The unique identifier of the group.
+    ///
+    /// # Returns
+    /// Returns the member count as u32, or StellarSaveError::GroupNotFound if the group doesn't exist.
+    pub fn get_member_count(env: Env, group_id: u64) -> Result<u32, StellarSaveError> {
+        let key = StorageKeyBuilder::group_data(group_id);
+        let group = env.storage()
+            .persistent()
+            .get::<_, Group>(&key)
+            .ok_or(StellarSaveError::GroupNotFound)?;
+
+        Ok(group.member_count)
+    }
 
     /// Increments the group ID counter and returns the new ID.
     /// Tasks: Counter storage, Atomic increment, Overflow protection.
@@ -253,6 +269,23 @@ impl StellarSaveContract {
             .persistent()
             .get::<_, Group>(&key)
             .ok_or(StellarSaveError::GroupNotFound)
+    }
+
+    /// Returns the number of members in a specific group.
+    /// 
+    /// # Arguments
+    /// * `group_id` - The unique identifier of the group.
+    /// 
+    /// # Returns
+    /// Returns the member count as u32, or StellarSaveError::GroupNotFound if the group doesn't exist.
+    pub fn get_member_count(env: Env, group_id: u64) -> Result<u32, StellarSaveError> {
+        let key = StorageKeyBuilder::group_data(group_id);
+        let group = env.storage()
+            .persistent()
+            .get::<_, Group>(&key)
+            .ok_or(StellarSaveError::GroupNotFound)?;
+        
+        Ok(group.member_count)
     }
 
     /// Deletes a group from storage.
@@ -479,6 +512,59 @@ mod tests {
         let client = StellarSaveContractClient::new(&env, &contract_id);
 
         client.get_group(&999); // ID that doesn't exist
+    }
+
+    #[test]
+    fn test_get_member_count_success() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        let creator = Address::generate(&env);
+
+        // Create a group with initial member_count of 0
+        let group_id = 1;
+        let group = Group::new(group_id, creator.clone(), 100, 3600, 5, 2, 12345);
+        
+        // Store the group
+        env.storage().persistent().set(&StorageKeyBuilder::group_data(group_id), &group);
+
+        // Get member count
+        let member_count = client.get_member_count(&group_id);
+        assert_eq!(member_count, 0);
+    }
+
+    #[test]
+    fn test_get_member_count_with_members() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        let creator = Address::generate(&env);
+
+        // Create a group and manually set member_count
+        let group_id = 1;
+        let mut group = Group::new(group_id, creator.clone(), 100, 3600, 5, 2, 12345);
+        
+        // Simulate adding members
+        group.add_member();
+        group.add_member();
+        group.add_member();
+        
+        // Store the group
+        env.storage().persistent().set(&StorageKeyBuilder::group_data(group_id), &group);
+
+        // Get member count
+        let member_count = client.get_member_count(&group_id);
+        assert_eq!(member_count, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "Status(ContractError(1001))")] // 1001 is GroupNotFound
+    fn test_get_member_count_not_found() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        client.get_member_count(&999); // ID that doesn't exist
     }
 
     // #[test]
