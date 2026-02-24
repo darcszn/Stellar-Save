@@ -55,14 +55,6 @@ pub struct ContractConfig {
     pub max_cycle_duration: u64,
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MemberProfile {
-    pub address: Address,
-    pub group_id: u64,
-    pub joined_at: u64,
-}
-
 impl ContractConfig {
     pub fn validate(&self) -> bool {
         self.min_contribution > 0 && 
@@ -646,6 +638,53 @@ impl StellarSaveContract {
         Ok(total)
     }
 
+    /// Gets the payout received by a specific member.
+    /// 
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `group_id` - ID of the group
+    /// * `member_address` - Address of the member to query
+    /// 
+    /// # Returns
+    /// * `Ok(Option<PayoutRecord>)` - Payout record if member received one, None if not
+    /// * `Err(StellarSaveError)` - If group doesn't exist or member is not part of the group
+    pub fn get_member_payout(
+        env: Env,
+        group_id: u64,
+        member_address: Address,
+    ) -> Result<Option<PayoutRecord>, StellarSaveError> {
+        // Verify the group exists
+        let group_key = StorageKeyBuilder::group_data(group_id);
+        let group = env.storage()
+            .persistent()
+            .get::<_, Group>(&group_key)
+            .ok_or(StellarSaveError::GroupNotFound)?;
+
+        // Verify the member is part of the group
+        let member_key = StorageKeyBuilder::member_profile(group_id, member_address.clone());
+        if !env.storage().persistent().has(&member_key) {
+            return Err(StellarSaveError::NotMember);
+        }
+
+        // Query payout history for all cycles up to current_cycle
+        for cycle in 0..=group.current_cycle {
+            let payout_key = StorageKeyBuilder::payout_record(group_id, cycle);
+            
+            if let Some(payout_record) = env.storage()
+                .persistent()
+                .get::<_, PayoutRecord>(&payout_key)
+            {
+                // Filter by recipient
+                if payout_record.recipient == member_address {
+                    return Ok(Some(payout_record));
+                }
+            }
+        }
+        
+        // Member hasn't received any payout yet
+        Ok(None)
+    }
+
     /// Gets the complete payout schedule with dates for all members.
     /// 
     /// # Arguments
@@ -793,23 +832,6 @@ impl StellarSaveContract {
         Ok(sorted_queue)
     }
   
-    /// Returns the number of members in a specific group.
-    /// 
-    /// # Arguments
-    /// * `group_id` - The unique identifier of the group.
-    /// 
-    /// # Returns
-    /// Returns the member count as u32, or StellarSaveError::GroupNotFound if the group doesn't exist.
-    pub fn get_member_count(env: Env, group_id: u64) -> Result<u32, StellarSaveError> {
-        let key = StorageKeyBuilder::group_data(group_id);
-        let group = env.storage()
-            .persistent()
-            .get::<_, Group>(&key)
-            .ok_or(StellarSaveError::GroupNotFound)?;
-        
-        Ok(group.member_count)
-    }
-
     /// Assigns or reassigns payout positions to members.
     /// 
     /// # Arguments
@@ -4725,6 +4747,136 @@ mod tests {
         
         let result = client.try_get_total_paid_out(&999);
         assert_eq!(result, Err(Ok(StellarSaveError::GroupNotFound)));
+    }
+    
+    #[test]
+    fn test_get_member_payout_no_payout_received() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        
+        let creator = Address::generate(&env);
+        let member = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &3);
+        
+        // Add member to group
+        client.join_group(&group_id, &member);
+        
+        // Member hasn't received any payout yet
+        let result = client.get_member_payout(&group_id, &member);
+        assert_eq!(result, None);
+    }
+    
+    #[test]
+    fn test_get_member_payout_received_payout() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        
+        let creator = Address::generate(&env);
+        let member = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &3);
+        
+        // Add member to group
+        client.join_group(&group_id, &member);
+        
+        // Simulate a payout to the member in cycle 0
+        let payout = PayoutRecord::new(member.clone(), group_id, 0, 300, env.ledger().timestamp());
+        let payout_key = StorageKeyBuilder::payout_record(group_id, 0);
+        env.storage().persistent().set(&payout_key, &payout);
+        
+        // Update group current_cycle to reflect the payout
+        let group_key = StorageKeyBuilder::group_data(group_id);
+        let mut group: Group = env.storage().persistent().get(&group_key).unwrap();
+        group.current_cycle = 1;
+        env.storage().persistent().set(&group_key, &group);
+        
+        // Member should have received a payout
+        let result = client.get_member_payout(&group_id, &member);
+        assert!(result.is_some());
+        
+        let payout_record = result.unwrap();
+        assert_eq!(payout_record.recipient, member);
+        assert_eq!(payout_record.group_id, group_id);
+        assert_eq!(payout_record.cycle_number, 0);
+        assert_eq!(payout_record.amount, 300);
+    }
+    
+    #[test]
+    fn test_get_member_payout_multiple_cycles() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        
+        let creator = Address::generate(&env);
+        let member1 = Address::generate(&env);
+        let member2 = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &3);
+        
+        // Add members to group
+        client.join_group(&group_id, &member1);
+        client.join_group(&group_id, &member2);
+        
+        // Simulate payouts across multiple cycles
+        let payout1 = PayoutRecord::new(member1.clone(), group_id, 0, 300, env.ledger().timestamp());
+        let payout2 = PayoutRecord::new(member2.clone(), group_id, 1, 300, env.ledger().timestamp());
+        let payout3 = PayoutRecord::new(creator.clone(), group_id, 2, 300, env.ledger().timestamp());
+        
+        env.storage().persistent().set(&StorageKeyBuilder::payout_record(group_id, 0), &payout1);
+        env.storage().persistent().set(&StorageKeyBuilder::payout_record(group_id, 1), &payout2);
+        env.storage().persistent().set(&StorageKeyBuilder::payout_record(group_id, 2), &payout3);
+        
+        // Update group current_cycle
+        let group_key = StorageKeyBuilder::group_data(group_id);
+        let mut group: Group = env.storage().persistent().get(&group_key).unwrap();
+        group.current_cycle = 3;
+        env.storage().persistent().set(&group_key, &group);
+        
+        // Check member1's payout (should be cycle 0)
+        let result1 = client.get_member_payout(&group_id, &member1);
+        assert!(result1.is_some());
+        assert_eq!(result1.unwrap().cycle_number, 0);
+        
+        // Check member2's payout (should be cycle 1)
+        let result2 = client.get_member_payout(&group_id, &member2);
+        assert!(result2.is_some());
+        assert_eq!(result2.unwrap().cycle_number, 1);
+        
+        // Check creator's payout (should be cycle 2)
+        let result3 = client.get_member_payout(&group_id, &creator);
+        assert!(result3.is_some());
+        assert_eq!(result3.unwrap().cycle_number, 2);
+    }
+    
+    #[test]
+    fn test_get_member_payout_group_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        
+        let member = Address::generate(&env);
+        
+        let result = client.try_get_member_payout(&999, &member);
+        assert_eq!(result, Err(Ok(StellarSaveError::GroupNotFound)));
+    }
+    
+    #[test]
+    fn test_get_member_payout_not_member() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        
+        let creator = Address::generate(&env);
+        let non_member = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &3);
+        
+        let result = client.try_get_member_payout(&group_id, &non_member);
+        assert_eq!(result, Err(Ok(StellarSaveError::NotMember)));
     }
     
     #[test]
