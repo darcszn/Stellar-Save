@@ -903,6 +903,39 @@ impl StellarSaveContract {
         Ok(None)
     }
 
+    /// Retrieves payout details for a specific cycle.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `group_id` - The ID of the group
+    /// * `cycle` - The cycle number to retrieve payout for
+    ///
+    /// # Returns
+    /// * `Ok(PayoutRecord)` - The payout record for the specified cycle
+    /// * `Err(StellarSaveError::GroupNotFound)` - If the group doesn't exist
+    /// * `Err(StellarSaveError::PayoutFailed)` - If no payout exists for this cycle
+    ///
+    /// # Example
+    /// ```ignore
+    /// let payout = contract.get_payout(env, 1, 0)?;
+    /// assert_eq!(payout.cycle_number, 0);
+    /// ```
+    pub fn get_payout(
+        env: Env,
+        group_id: u64,
+        cycle: u32,
+    ) -> Result<PayoutRecord, StellarSaveError> {
+        // Verify group exists
+        let _group = Self::get_group(env.clone(), group_id)?;
+
+        // Load payout from storage
+        let key = StorageKeyBuilder::payout_record(group_id, cycle);
+        let payout: Option<PayoutRecord> = env.storage().persistent().get(&key);
+
+        // Handle not found
+        payout.ok_or(StellarSaveError::PayoutFailed)
+    }
+
     /// Gets the complete payout schedule with dates for all members.
     ///
     /// # Arguments
@@ -1969,6 +2002,95 @@ impl StellarSaveContract {
         env.storage().persistent().remove(&withdrawal_key);
 
         Ok(())
+    }
+
+    /// Lists all members of a group with pagination support.
+    ///
+    /// Returns a vector of member addresses sorted by join order (payout position).
+    /// Members are stored in the order they joined, which corresponds to their
+    /// payout position in the ROSCA rotation.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `group_id` - ID of the group to query
+    /// * `offset` - Number of members to skip (for pagination, 0-indexed)
+    /// * `limit` - Maximum number of members to return (capped at 100)
+    ///
+    /// # Returns
+    /// * `Ok(Vec<Address>)` - Vector of member addresses sorted by join order
+    /// * `Err(StellarSaveError::GroupNotFound)` - If the group doesn't exist
+    /// * `Err(StellarSaveError::Overflow)` - If pagination parameters cause overflow
+    ///
+    /// # Pagination
+    /// - Use offset=0, limit=10 to get first 10 members
+    /// - Use offset=10, limit=10 to get next 10 members
+    /// - Limit is capped at 100 for gas optimization
+    /// - Returns empty vector if offset is beyond total member count
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Get first 20 members
+    /// let first_page = contract.get_group_members(env, 1, 0, 20)?;
+    ///
+    /// // Get next 20 members
+    /// let second_page = contract.get_group_members(env, 1, 20, 20)?;
+    /// ```
+    pub fn get_group_members(
+        env: Env,
+        group_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<Address>, StellarSaveError> {
+        // 1. Verify group exists
+        let group_key = StorageKeyBuilder::group_data(group_id);
+        let _group = env
+            .storage()
+            .persistent()
+            .get::<_, Group>(&group_key)
+            .ok_or(StellarSaveError::GroupNotFound)?;
+
+        // 2. Validate pagination parameters
+        if offset.checked_add(limit).is_none() {
+            return Err(StellarSaveError::Overflow);
+        }
+
+        // 3. Load all members from storage
+        let members_key = StorageKeyBuilder::group_members(group_id);
+        let all_members: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&members_key)
+            .unwrap_or(Vec::new(&env));
+
+        // 4. Members are already sorted by join order (stored in join order)
+        // No additional sorting needed as they're stored in the order they joined
+
+        // 5. Apply pagination with gas optimization (cap limit at 100)
+        let page_limit = cmp::min(limit, 100);
+        let total_members = all_members.len();
+
+        // If offset is beyond total members, return empty vector
+        if offset >= total_members {
+            return Ok(Vec::new(&env));
+        }
+
+        // Calculate end index
+        let end_index = cmp::min(
+            offset
+                .checked_add(page_limit)
+                .ok_or(StellarSaveError::Overflow)?,
+            total_members,
+        );
+
+        // 6. Extract paginated slice
+        let mut paginated_members = Vec::new(&env);
+        for i in offset..end_index {
+            if let Some(member) = all_members.get(i) {
+                paginated_members.push_back(member);
+            }
+        }
+
+        Ok(paginated_members)
     }
 
     /// Activates a group once minimum members have joined.
@@ -7306,6 +7428,353 @@ mod tests {
         });
         
         assert!(payout_event.is_some());
+    }
+
+    #[test]
+    fn test_get_group_members_empty_group() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &5);
+
+        // Get members from empty group
+        let members = client.get_group_members(&group_id, &0, &10);
+        assert_eq!(members.len(), 0);
+    }
+
+    #[test]
+    fn test_get_group_members_single_member() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &5);
+
+        // Add one member
+        client.join_group(&group_id, &creator);
+
+        // Get members
+        let members = client.get_group_members(&group_id, &0, &10);
+        assert_eq!(members.len(), 1);
+        assert_eq!(members.get(0).unwrap(), creator);
+    }
+
+    #[test]
+    fn test_get_group_members_multiple_members_sorted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let member1 = Address::generate(&env);
+        let member2 = Address::generate(&env);
+        let member3 = Address::generate(&env);
+
+        let group_id = client.create_group(&creator, &100, &3600, &5);
+
+        // Add members in specific order
+        client.join_group(&group_id, &creator);
+        client.join_group(&group_id, &member1);
+        client.join_group(&group_id, &member2);
+        client.join_group(&group_id, &member3);
+
+        // Get all members
+        let members = client.get_group_members(&group_id, &0, &10);
+        assert_eq!(members.len(), 4);
+
+        // Verify they're in join order
+        assert_eq!(members.get(0).unwrap(), creator);
+        assert_eq!(members.get(1).unwrap(), member1);
+        assert_eq!(members.get(2).unwrap(), member2);
+        assert_eq!(members.get(3).unwrap(), member3);
+    }
+
+    #[test]
+    fn test_get_group_members_pagination_first_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &10);
+
+        // Add 5 members
+        let mut all_members = Vec::new(&env);
+        for i in 0..5 {
+            let member = Address::generate(&env);
+            all_members.push_back(member.clone());
+            client.join_group(&group_id, &member);
+        }
+
+        // Get first 3 members
+        let members = client.get_group_members(&group_id, &0, &3);
+        assert_eq!(members.len(), 3);
+        assert_eq!(members.get(0).unwrap(), all_members.get(0).unwrap());
+        assert_eq!(members.get(1).unwrap(), all_members.get(1).unwrap());
+        assert_eq!(members.get(2).unwrap(), all_members.get(2).unwrap());
+    }
+
+    #[test]
+    fn test_get_group_members_pagination_second_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &10);
+
+        // Add 5 members
+        let mut all_members = Vec::new(&env);
+        for i in 0..5 {
+            let member = Address::generate(&env);
+            all_members.push_back(member.clone());
+            client.join_group(&group_id, &member);
+        }
+
+        // Get second page (offset 3, limit 2)
+        let members = client.get_group_members(&group_id, &3, &2);
+        assert_eq!(members.len(), 2);
+        assert_eq!(members.get(0).unwrap(), all_members.get(3).unwrap());
+        assert_eq!(members.get(1).unwrap(), all_members.get(4).unwrap());
+    }
+
+    #[test]
+    fn test_get_group_members_pagination_beyond_total() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &10);
+
+        // Add 3 members
+        for i in 0..3 {
+            let member = Address::generate(&env);
+            client.join_group(&group_id, &member);
+        }
+
+        // Try to get members beyond total count
+        let members = client.get_group_members(&group_id, &10, &5);
+        assert_eq!(members.len(), 0);
+    }
+
+    #[test]
+    fn test_get_group_members_pagination_partial_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &10);
+
+        // Add 5 members
+        let mut all_members = Vec::new(&env);
+        for i in 0..5 {
+            let member = Address::generate(&env);
+            all_members.push_back(member.clone());
+            client.join_group(&group_id, &member);
+        }
+
+        // Request 10 members starting from offset 3 (only 2 available)
+        let members = client.get_group_members(&group_id, &3, &10);
+        assert_eq!(members.len(), 2);
+        assert_eq!(members.get(0).unwrap(), all_members.get(3).unwrap());
+        assert_eq!(members.get(1).unwrap(), all_members.get(4).unwrap());
+    }
+
+    #[test]
+    fn test_get_group_members_limit_capped_at_100() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &10);
+
+        // Add 5 members
+        for i in 0..5 {
+            let member = Address::generate(&env);
+            client.join_group(&group_id, &member);
+        }
+
+        // Request with limit > 100 (should be capped)
+        let members = client.get_group_members(&group_id, &0, &150);
+        // Should return all 5 members (not fail, just capped at available)
+        assert_eq!(members.len(), 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #1001)")]
+    fn test_get_group_members_group_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        // Try to get members from non-existent group
+        client.get_group_members(&999, &0, &10);
+    }
+
+    #[test]
+    fn test_get_group_members_zero_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &5);
+
+        // Add members
+        client.join_group(&group_id, &creator);
+
+        // Request with limit 0
+        let members = client.get_group_members(&group_id, &0, &0);
+        assert_eq!(members.len(), 0);
+    }
+
+    #[test]
+    fn test_get_payout_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &3);
+
+        client.join_group(&group_id, &creator);
+
+        // Create a payout record
+        let payout = PayoutRecord::new(creator.clone(), group_id, 0, 300, 1234567890);
+        let key = StorageKeyBuilder::payout_record(group_id, 0);
+        env.storage().persistent().set(&key, &payout);
+
+        // Retrieve the payout
+        let result = client.get_payout(&group_id, &0);
+        assert_eq!(result.recipient, creator);
+        assert_eq!(result.group_id, group_id);
+        assert_eq!(result.cycle_number, 0);
+        assert_eq!(result.amount, 300);
+        assert_eq!(result.timestamp, 1234567890);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #4001)")]
+    fn test_get_payout_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &3);
+
+        client.join_group(&group_id, &creator);
+
+        // Try to get a payout that doesn't exist
+        client.get_payout(&group_id, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #1001)")]
+    fn test_get_payout_group_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        // Try to get a payout for a non-existent group
+        client.get_payout(&999, &0);
+    }
+
+    #[test]
+    fn test_get_payout_multiple_cycles() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let member1 = Address::generate(&env);
+        let member2 = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &3);
+
+        client.join_group(&group_id, &creator);
+        client.join_group(&group_id, &member1);
+        client.join_group(&group_id, &member2);
+
+        // Create payout records for multiple cycles
+        let payout0 = PayoutRecord::new(creator.clone(), group_id, 0, 300, 1234567890);
+        let payout1 = PayoutRecord::new(member1.clone(), group_id, 1, 300, 1234571490);
+        let payout2 = PayoutRecord::new(member2.clone(), group_id, 2, 300, 1234575090);
+
+        let key0 = StorageKeyBuilder::payout_record(group_id, 0);
+        let key1 = StorageKeyBuilder::payout_record(group_id, 1);
+        let key2 = StorageKeyBuilder::payout_record(group_id, 2);
+
+        env.storage().persistent().set(&key0, &payout0);
+        env.storage().persistent().set(&key1, &payout1);
+        env.storage().persistent().set(&key2, &payout2);
+
+        // Retrieve each payout
+        let result0 = client.get_payout(&group_id, &0);
+        assert_eq!(result0.recipient, creator);
+        assert_eq!(result0.cycle_number, 0);
+
+        let result1 = client.get_payout(&group_id, &1);
+        assert_eq!(result1.recipient, member1);
+        assert_eq!(result1.cycle_number, 1);
+
+        let result2 = client.get_payout(&group_id, &2);
+        assert_eq!(result2.recipient, member2);
+        assert_eq!(result2.cycle_number, 2);
+    }
+
+    #[test]
+    fn test_get_payout_different_groups() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator1 = Address::generate(&env);
+        let creator2 = Address::generate(&env);
+        let group_id1 = client.create_group(&creator1, &100, &3600, &3);
+        let group_id2 = client.create_group(&creator2, &200, &7200, &5);
+
+        client.join_group(&group_id1, &creator1);
+        client.join_group(&group_id2, &creator2);
+
+        // Create payout records for different groups
+        let payout1 = PayoutRecord::new(creator1.clone(), group_id1, 0, 300, 1234567890);
+        let payout2 = PayoutRecord::new(creator2.clone(), group_id2, 0, 1000, 1234567890);
+
+        let key1 = StorageKeyBuilder::payout_record(group_id1, 0);
+        let key2 = StorageKeyBuilder::payout_record(group_id2, 0);
+
+        env.storage().persistent().set(&key1, &payout1);
+        env.storage().persistent().set(&key2, &payout2);
+
+        // Retrieve payouts for each group
+        let result1 = client.get_payout(&group_id1, &0);
+        assert_eq!(result1.group_id, group_id1);
+        assert_eq!(result1.amount, 300);
+
+        let result2 = client.get_payout(&group_id2, &0);
+        assert_eq!(result2.group_id, group_id2);
+        assert_eq!(result2.amount, 1000);
     }
 
     #[test]
