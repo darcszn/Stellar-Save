@@ -24,6 +24,7 @@ pub mod error;
 pub mod events;
 pub mod group;
 pub mod payout;
+pub mod payout_executor;
 pub mod pool;
 pub mod status;
 pub mod storage;
