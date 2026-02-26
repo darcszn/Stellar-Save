@@ -1,6 +1,7 @@
 //! Helper utilities for formatting and display
 
 use soroban_sdk::{String, Env, Bytes};
+use crate::Group;
 
 /// Formats a group ID for display with a "GROUP-" prefix.
 /// 
@@ -53,10 +54,33 @@ pub fn format_group_id(env: &Env, group_id: u64) -> String {
     String::from_bytes(env, &result)
 }
 
+/// Checks if the current cycle deadline has passed.
+/// 
+/// # Arguments
+/// * `group` - The group to check
+/// * `current_time` - Current timestamp in seconds
+/// 
+/// # Returns
+/// `true` if the deadline has passed, `false` otherwise
+/// 
+/// # Example
+/// ```
+/// let deadline_passed = is_cycle_deadline_passed(&group, env.ledger().timestamp());
+/// ```
+pub fn is_cycle_deadline_passed(group: &Group, current_time: u64) -> bool {
+    if !group.started {
+        return false;
+    }
+    
+    let cycle_deadline = group.started_at + (group.cycle_duration * (group.current_cycle as u64 + 1));
+    current_time > cycle_deadline
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::Env;
+    use soroban_sdk::{Env, Address};
+    use crate::group::GroupStatus;
 
     #[test]
     fn test_format_group_id_single_digit() {
@@ -85,5 +109,49 @@ mod tests {
         let result = format_group_id(&env, u64::MAX);
         let expected = String::from_str(&env, "GROUP-18446744073709551615");
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_is_cycle_deadline_passed_not_started() {
+        let env = Env::default();
+        let creator = Address::generate(&env);
+        let group = Group::new(1, creator, 1000000, 604800, 5, 2, 1000);
+        
+        assert!(!is_cycle_deadline_passed(&group, 2000));
+    }
+
+    #[test]
+    fn test_is_cycle_deadline_passed_before_deadline() {
+        let env = Env::default();
+        let creator = Address::generate(&env);
+        let mut group = Group::new(1, creator, 1000000, 604800, 5, 2, 1000);
+        group.activate(1000);
+        
+        // Current time before deadline (started_at + cycle_duration)
+        assert!(!is_cycle_deadline_passed(&group, 1000 + 604800));
+    }
+
+    #[test]
+    fn test_is_cycle_deadline_passed_after_deadline() {
+        let env = Env::default();
+        let creator = Address::generate(&env);
+        let mut group = Group::new(1, creator, 1000000, 604800, 5, 2, 1000);
+        group.activate(1000);
+        
+        // Current time after deadline
+        assert!(is_cycle_deadline_passed(&group, 1000 + 604800 + 1));
+    }
+
+    #[test]
+    fn test_is_cycle_deadline_passed_second_cycle() {
+        let env = Env::default();
+        let creator = Address::generate(&env);
+        let mut group = Group::new(1, creator, 1000000, 604800, 5, 2, 1000);
+        group.activate(1000);
+        group.advance_cycle(&env);
+        
+        // Deadline for cycle 1 is started_at + (cycle_duration * 2)
+        assert!(!is_cycle_deadline_passed(&group, 1000 + 604800 * 2));
+        assert!(is_cycle_deadline_passed(&group, 1000 + 604800 * 2 + 1));
     }
 }
