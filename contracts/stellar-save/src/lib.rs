@@ -152,6 +152,66 @@ impl StellarSaveContract {
         Ok(())
     }
 
+    /// Validates that a cycle duration is within the allowed range.
+    ///
+    /// Checks the provided cycle duration against the contract's configured
+    /// minimum and maximum cycle duration limits.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment for storage access
+    /// * `cycle_duration` - The cycle duration to validate (in seconds)
+    ///
+    /// # Returns
+    /// * `Ok(())` - The cycle duration is valid
+    /// * `Err(StellarSaveError::InvalidState)` - Duration is outside allowed range
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Validate a 7-day cycle (604800 seconds)
+    /// StellarSaveContract::validate_cycle_duration(&env, 604800)?;
+    /// ```
+    pub fn validate_cycle_duration(env: &Env, cycle_duration: u64) -> Result<(), StellarSaveError> {
+        let config_key = StorageKeyBuilder::contract_config();
+        
+        if let Some(config) = env.storage().persistent().get::<_, ContractConfig>(&config_key) {
+            if cycle_duration < config.min_cycle_duration || cycle_duration > config.max_cycle_duration {
+                return Err(StellarSaveError::InvalidState);
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Validates that a contribution amount is within the allowed range.
+    ///
+    /// Checks the provided contribution amount against the contract's configured
+    /// minimum and maximum contribution limits.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment for storage access
+    /// * `amount` - The contribution amount to validate (in stroops)
+    ///
+    /// # Returns
+    /// * `Ok(())` - The amount is valid
+    /// * `Err(StellarSaveError::InvalidAmount)` - Amount is outside allowed range
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Validate a 10 XLM contribution
+    /// StellarSaveContract::validate_contribution_amount_range(&env, 100_000_000)?;
+    /// ```
+    pub fn validate_contribution_amount_range(env: &Env, amount: i128) -> Result<(), StellarSaveError> {
+        let config_key = StorageKeyBuilder::contract_config();
+        
+        if let Some(config) = env.storage().persistent().get::<_, ContractConfig>(&config_key) {
+            if amount < config.min_contribution || amount > config.max_contribution {
+                return Err(StellarSaveError::InvalidAmount);
+            }
+        }
+        
+        Ok(())
+    }
+
     /// Records a contribution in storage and updates member statistics.
     ///
     /// This is an internal helper function that handles all the storage operations
@@ -650,6 +710,62 @@ impl StellarSaveContract {
         }
 
         Ok(total)
+    }
+
+    /// Gets the current balance held for a specific group.
+    ///
+    /// Calculates the balance by summing all contributions across all cycles
+    /// and subtracting all payouts that have been made.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `group_id` - ID of the group
+    ///
+    /// # Returns
+    /// * `Ok(i128)` - Current balance held for the group in stroops
+    /// * `Err(StellarSaveError::GroupNotFound)` - If group doesn't exist
+    /// * `Err(StellarSaveError::Overflow)` - If calculation overflows
+    pub fn get_group_balance(env: Env, group_id: u64) -> Result<i128, StellarSaveError> {
+        let group_key = StorageKeyBuilder::group_data(group_id);
+        let group = env
+            .storage()
+            .persistent()
+            .get::<_, Group>(&group_key)
+            .ok_or(StellarSaveError::GroupNotFound)?;
+
+        let mut total_contributions: i128 = 0;
+        let mut total_payouts: i128 = 0;
+
+        // Sum all contributions across all cycles
+        for cycle in 0..=group.current_cycle {
+            let total_key = StorageKeyBuilder::contribution_cycle_total(group_id, cycle);
+            if let Some(cycle_total) = env.storage().persistent().get::<_, i128>(&total_key) {
+                total_contributions = total_contributions
+                    .checked_add(cycle_total)
+                    .ok_or(StellarSaveError::Overflow)?;
+            }
+        }
+
+        // Sum all payouts
+        for cycle in 0..group.current_cycle {
+            let payout_key = StorageKeyBuilder::payout_record(group_id, cycle);
+            if let Some(payout_record) = env
+                .storage()
+                .persistent()
+                .get::<_, PayoutRecord>(&payout_key)
+            {
+                total_payouts = total_payouts
+                    .checked_add(payout_record.amount)
+                    .ok_or(StellarSaveError::Overflow)?;
+            }
+        }
+
+        // Calculate balance
+        let balance = total_contributions
+            .checked_sub(total_payouts)
+            .ok_or(StellarSaveError::Overflow)?;
+
+        Ok(balance)
     }
 
     /// Gets all payout records for a group with pagination and sorting.
@@ -1252,6 +1368,27 @@ impl StellarSaveContract {
     pub fn get_total_groups_created(env: Env) -> u64 {
         let key = StorageKeyBuilder::next_group_id();
         env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    /// Gets the total XLM balance held by the contract.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    ///
+    /// # Returns
+    /// Returns the contract's current XLM balance in stroops (1 XLM = 10^7 stroops).
+    /// 
+    /// # Note
+    /// This is a placeholder implementation. To get the actual balance, you would need to:
+    /// 1. Get the native token contract address
+    /// 2. Create a token client for the native asset
+    /// 3. Query the balance for this contract's address
+    pub fn get_contract_balance(_env: Env) -> i128 {
+        // Placeholder: Return 0
+        // In production, query the native token contract:
+        // let native_token = token::Client::new(&env, &native_token_address);
+        // native_token.balance(&env.current_contract_address())
+        0
     }
 
     /// Gets the total amount contributed by a member across all cycles.
@@ -2274,6 +2411,19 @@ mod tests {
 
         let count = client.get_total_groups_created();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_get_contract_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        // Query initial balance
+        let balance = client.get_contract_balance();
+        assert_eq!(balance, 0);
     }
 
     #[test]
@@ -4074,6 +4224,195 @@ mod tests {
         assert_eq!(result2.unwrap_err(), StellarSaveError::InvalidAmount);
     }
 
+    // Tests for validate_cycle_duration function
+
+    #[test]
+    fn test_validate_cycle_duration_valid() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(StellarSaveContract, ());
+
+        // Set up config with min=3600 (1 hour), max=2592000 (30 days)
+        let config = ContractConfig {
+            admin,
+            min_contribution: 1_000_000,
+            max_contribution: 1_000_000_000,
+            min_members: 2,
+            max_members: 100,
+            min_cycle_duration: 3600,
+            max_cycle_duration: 2592000,
+        };
+        env.storage()
+            .persistent()
+            .set(&StorageKeyBuilder::contract_config(), &config);
+
+        // Test valid duration (7 days)
+        let result = env.as_contract(&contract_id, || {
+            StellarSaveContract::validate_cycle_duration(&env, 604800)
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_cycle_duration_too_short() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(StellarSaveContract, ());
+
+        let config = ContractConfig {
+            admin,
+            min_contribution: 1_000_000,
+            max_contribution: 1_000_000_000,
+            min_members: 2,
+            max_members: 100,
+            min_cycle_duration: 3600,
+            max_cycle_duration: 2592000,
+        };
+        env.storage()
+            .persistent()
+            .set(&StorageKeyBuilder::contract_config(), &config);
+
+        // Test duration below minimum
+        let result = env.as_contract(&contract_id, || {
+            StellarSaveContract::validate_cycle_duration(&env, 1800)
+        });
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StellarSaveError::InvalidState);
+    }
+
+    #[test]
+    fn test_validate_cycle_duration_too_long() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(StellarSaveContract, ());
+
+        let config = ContractConfig {
+            admin,
+            min_contribution: 1_000_000,
+            max_contribution: 1_000_000_000,
+            min_members: 2,
+            max_members: 100,
+            min_cycle_duration: 3600,
+            max_cycle_duration: 2592000,
+        };
+        env.storage()
+            .persistent()
+            .set(&StorageKeyBuilder::contract_config(), &config);
+
+        // Test duration above maximum
+        let result = env.as_contract(&contract_id, || {
+            StellarSaveContract::validate_cycle_duration(&env, 3000000)
+        });
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StellarSaveError::InvalidState);
+    }
+
+    #[test]
+    fn test_validate_cycle_duration_no_config() {
+        let env = Env::default();
+        let contract_id = env.register(StellarSaveContract, ());
+
+        // Test without config (should pass)
+        let result = env.as_contract(&contract_id, || {
+            StellarSaveContract::validate_cycle_duration(&env, 604800)
+        });
+        assert!(result.is_ok());
+    }
+
+    // Tests for validate_contribution_amount_range function
+
+    #[test]
+    fn test_validate_contribution_amount_range_valid() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(StellarSaveContract, ());
+
+        let config = ContractConfig {
+            admin,
+            min_contribution: 1_000_000,      // 0.1 XLM
+            max_contribution: 1_000_000_000,  // 100 XLM
+            min_members: 2,
+            max_members: 100,
+            min_cycle_duration: 3600,
+            max_cycle_duration: 2592000,
+        };
+        env.storage()
+            .persistent()
+            .set(&StorageKeyBuilder::contract_config(), &config);
+
+        // Test valid amount (10 XLM)
+        let result = env.as_contract(&contract_id, || {
+            StellarSaveContract::validate_contribution_amount_range(&env, 100_000_000)
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_contribution_amount_range_too_low() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(StellarSaveContract, ());
+
+        let config = ContractConfig {
+            admin,
+            min_contribution: 1_000_000,
+            max_contribution: 1_000_000_000,
+            min_members: 2,
+            max_members: 100,
+            min_cycle_duration: 3600,
+            max_cycle_duration: 2592000,
+        };
+        env.storage()
+            .persistent()
+            .set(&StorageKeyBuilder::contract_config(), &config);
+
+        // Test amount below minimum
+        let result = env.as_contract(&contract_id, || {
+            StellarSaveContract::validate_contribution_amount_range(&env, 500_000)
+        });
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StellarSaveError::InvalidAmount);
+    }
+
+    #[test]
+    fn test_validate_contribution_amount_range_too_high() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(StellarSaveContract, ());
+
+        let config = ContractConfig {
+            admin,
+            min_contribution: 1_000_000,
+            max_contribution: 1_000_000_000,
+            min_members: 2,
+            max_members: 100,
+            min_cycle_duration: 3600,
+            max_cycle_duration: 2592000,
+        };
+        env.storage()
+            .persistent()
+            .set(&StorageKeyBuilder::contract_config(), &config);
+
+        // Test amount above maximum
+        let result = env.as_contract(&contract_id, || {
+            StellarSaveContract::validate_contribution_amount_range(&env, 2_000_000_000)
+        });
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StellarSaveError::InvalidAmount);
+    }
+
+    #[test]
+    fn test_validate_contribution_amount_range_no_config() {
+        let env = Env::default();
+        let contract_id = env.register(StellarSaveContract, ());
+
+        // Test without config (should pass)
+        let result = env.as_contract(&contract_id, || {
+            StellarSaveContract::validate_contribution_amount_range(&env, 100_000_000)
+        });
+        assert!(result.is_ok());
+    }
+
     // Tests for get_missed_contributions function
 
     #[test]
@@ -5866,7 +6205,90 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
         let result = client.try_get_total_paid_out(&999);
+        assert_eq!(result, Err(Ok(StellarSaveError::GroupNotFound)));
+    }
+
+    // Tests for get_group_balance function
+
+    #[test]
+    fn test_get_group_balance_no_activity() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &3);
+
+        let balance = client.get_group_balance(&group_id);
+        assert_eq!(balance, 0);
+    }
+
+    #[test]
+    fn test_get_group_balance_with_contributions_no_payouts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &3);
+
+        // Add contributions for cycle 0
+        let total_key = StorageKeyBuilder::contribution_cycle_total(group_id, 0);
+        env.storage().persistent().set(&total_key, &300_i128);
+
+        let balance = client.get_group_balance(&group_id);
+        assert_eq!(balance, 300);
+    }
+
+    #[test]
+    fn test_get_group_balance_with_contributions_and_payouts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let group_id = client.create_group(&creator, &100, &3600, &3);
+
+        let mut group: Group = env
+            .storage()
+            .persistent()
+            .get(&StorageKeyBuilder::group_data(group_id))
+            .unwrap();
+        group.current_cycle = 2;
+        env.storage()
+            .persistent()
+            .set(&StorageKeyBuilder::group_data(group_id), &group);
+
+        // Add contributions for cycles 0 and 1
+        env.storage()
+            .persistent()
+            .set(&StorageKeyBuilder::contribution_cycle_total(group_id, 0), &300_i128);
+        env.storage()
+            .persistent()
+            .set(&StorageKeyBuilder::contribution_cycle_total(group_id, 1), &300_i128);
+
+        // Add payout for cycle 0
+        let payout = PayoutRecord::new(creator.clone(), group_id, 0, 300, env.ledger().timestamp());
+        env.storage()
+            .persistent()
+            .set(&StorageKeyBuilder::payout_record(group_id, 0), &payout);
+
+        let balance = client.get_group_balance(&group_id);
+        assert_eq!(balance, 300); // 600 contributions - 300 payout
+    }
+
+    #[test]
+    fn test_get_group_balance_group_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        let result = client.try_get_group_balance(&999);
         assert_eq!(result, Err(Ok(StellarSaveError::GroupNotFound)));
     }
 
