@@ -77,6 +77,10 @@ pub enum StellarSaveError {
     /// Added for ID Generation: The counter has reached its maximum limit.
     /// Error Code: 9003
     Overflow = 9003,
+
+    /// The contract operations are paused by an administrator.
+    /// Error Code: 9004
+    ContractPaused = 9004,
 }
 
 impl StellarSaveError {
@@ -142,6 +146,9 @@ impl StellarSaveError {
             }
             StellarSaveError::Overflow => {
                 "The ID counter has reached its maximum limit. No more IDs can be generated."
+            }
+            StellarSaveError::ContractPaused => {
+                "The contract is currently paused by an administrator. Please try again later."
             }
         }
     }
@@ -221,6 +228,8 @@ mod tests {
 
         assert_eq!(StellarSaveError::InternalError.code(), 9001);
         assert_eq!(StellarSaveError::DataCorruption.code(), 9002);
+        assert_eq!(StellarSaveError::Overflow.code(), 9003);
+        assert_eq!(StellarSaveError::ContractPaused.code(), 9004);
     }
 
     #[test]
@@ -267,6 +276,10 @@ mod tests {
             StellarSaveError::DataCorruption.category(),
             ErrorCategory::System
         );
+        assert_eq!(
+            StellarSaveError::ContractPaused.category(),
+            ErrorCategory::System
+        );
     }
 
     #[test]
@@ -287,6 +300,8 @@ mod tests {
             StellarSaveError::InvalidRecipient,
             StellarSaveError::InternalError,
             StellarSaveError::DataCorruption,
+            StellarSaveError::Overflow,
+            StellarSaveError::ContractPaused,
         ];
 
         for error in &errors {

@@ -259,6 +259,8 @@ impl StellarSaveContract {
         amount: i128,
         timestamp: u64,
     ) -> Result<(), StellarSaveError> {
+        Self::assert_not_paused(env)?;
+
         // 1. Check if member has already contributed in this cycle
         let contrib_key = StorageKeyBuilder::contribution_individual(
             group_id,
@@ -394,6 +396,52 @@ impl StellarSaveContract {
         Ok(())
     }
 
+    /// Asserts that the contract is not paused.
+    fn assert_not_paused(env: &Env) -> Result<(), StellarSaveError> {
+        let key = StorageKeyBuilder::emergency_pause();
+        let is_paused: bool = env.storage().persistent().get(&key).unwrap_or(false);
+        if is_paused {
+            return Err(StellarSaveError::ContractPaused);
+        }
+        Ok(())
+    }
+
+    /// Pauses all critical contract operations. Only allowed for the admin.
+    pub fn pause_contract(env: Env) -> Result<(), StellarSaveError> {
+        let config_key = StorageKeyBuilder::contract_config();
+        let config = env
+            .storage()
+            .persistent()
+            .get::<_, ContractConfig>(&config_key)
+            .ok_or(StellarSaveError::InvalidState)?;
+
+        config.admin.require_auth();
+
+        let pause_key = StorageKeyBuilder::emergency_pause();
+        env.storage().persistent().set(&pause_key, &true);
+
+        EventEmitter::emit_contract_paused(&env, config.admin, env.ledger().timestamp());
+        Ok(())
+    }
+
+    /// Unpauses all critical contract operations. Only allowed for the admin.
+    pub fn unpause_contract(env: Env) -> Result<(), StellarSaveError> {
+        let config_key = StorageKeyBuilder::contract_config();
+        let config = env
+            .storage()
+            .persistent()
+            .get::<_, ContractConfig>(&config_key)
+            .ok_or(StellarSaveError::InvalidState)?;
+
+        config.admin.require_auth();
+
+        let pause_key = StorageKeyBuilder::emergency_pause();
+        env.storage().persistent().set(&pause_key, &false);
+
+        EventEmitter::emit_contract_unpaused(&env, config.admin, env.ledger().timestamp());
+        Ok(())
+    }
+
     /// Creates a new savings group (ROSCA).
     /// Tasks: Validate parameters, Generate ID, Initialize Struct, Store Data, Emit Event.
     pub fn create_group(
@@ -403,6 +451,8 @@ impl StellarSaveContract {
         cycle_duration: u64,
         max_members: u32,
     ) -> Result<u64, StellarSaveError> {
+        Self::assert_not_paused(&env)?;
+
         // 1. Authorization: Only the creator can initiate this transaction
         creator.require_auth();
 
@@ -466,6 +516,8 @@ impl StellarSaveContract {
         new_duration: u64,
         new_max_members: u32,
     ) -> Result<(), StellarSaveError> {
+        Self::assert_not_paused(&env)?;
+
         // 1. Load existing group data
         let group_key = StorageKeyBuilder::group_data(group_id);
         let mut group = env
@@ -1054,6 +1106,8 @@ impl StellarSaveContract {
         caller: Address,
         mode: AssignmentMode,
     ) -> Result<(), StellarSaveError> {
+        Self::assert_not_paused(&env)?;
+
         caller.require_auth();
 
         let group_key = StorageKeyBuilder::group_data(group_id);
@@ -1158,6 +1212,8 @@ impl StellarSaveContract {
         amount: i128,
         cycle_number: u32,
     ) -> Result<(), StellarSaveError> {
+        Self::assert_not_paused(&env)?;
+
         // 1. Validate recipient address
         if recipient == Address::default() {
             return Err(StellarSaveError::InvalidRecipient);
@@ -1816,6 +1872,8 @@ impl StellarSaveContract {
     /// contract.join_group(env, 1, member_address)?;
     /// ```
     pub fn join_group(env: Env, group_id: u64, member: Address) -> Result<(), StellarSaveError> {
+        Self::assert_not_paused(&env)?;
+
         // Verify caller authorization
         member.require_auth();
 
@@ -1911,6 +1969,8 @@ impl StellarSaveContract {
         group_id: u64,
         member: Address,
     ) -> Result<(), StellarSaveError> {
+        Self::assert_not_paused(&env)?;
+
         member.require_auth();
 
         let group_key = StorageKeyBuilder::group_data(group_id);
@@ -7894,5 +7954,40 @@ mod tests {
         // This should fail due to overflow in amount calculation
         let result = client.try_transfer_payout(&group_id, &creator, &i128::MAX, &0);
         assert_eq!(result, Err(Ok(StellarSaveError::Overflow)));
+    }
+
+    #[test]
+    fn test_pause_unpause_success() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(StellarSaveContract, ());
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+
+        let config = ContractConfig {
+            admin: admin.clone(),
+            min_contribution: 10,
+            max_contribution: 1000,
+            min_members: 2,
+            max_members: 10,
+            min_cycle_duration: 3600,
+            max_cycle_duration: 86400,
+        };
+
+        env.mock_all_auths();
+        client.update_config(&config);
+
+        // Pause the contract
+        client.pause_contract();
+
+        let creator = Address::generate(&env);
+        // Operation should fail due to pause
+        let result = client.try_create_group(&creator, &100, &3600, &5);
+        assert_eq!(result, Err(Ok(StellarSaveError::ContractPaused)));
+
+        // Unpause the contract
+        client.unpause_contract();
+
+        // Operation should succeed
+        client.create_group(&creator, &100, &3600, &5);
     }
 }

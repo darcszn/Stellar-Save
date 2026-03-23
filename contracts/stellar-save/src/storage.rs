@@ -156,6 +156,10 @@ pub enum CounterKey {
     /// Group total paid out: COUNTER_GROUP_PAID_OUT_{group_id}
     /// Tracks total amount paid out incrementally.
     GroupTotalPaidOut(u64),
+
+    /// Emergency pause flag: COUNTER_EMERGENCY_PAUSE
+    /// Tracks if the contract is paused by admin.
+    EmergencyPause,
 }
 
 /// Utility functions for creating storage keys with consistent formatting.
@@ -283,6 +287,11 @@ impl StorageKeyBuilder {
     /// Creates a key for group total paid out.
     pub fn group_total_paid_out(group_id: u64) -> StorageKey {
         StorageKey::Counter(CounterKey::GroupTotalPaidOut(group_id))
+    }
+
+    /// Creates a key for the global emergency pause flag.
+    pub fn emergency_pause() -> StorageKey {
+        StorageKey::Counter(CounterKey::EmergencyPause)
     }
 }
 
