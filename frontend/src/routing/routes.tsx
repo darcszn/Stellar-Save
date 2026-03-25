@@ -2,6 +2,7 @@ import { lazy } from "react";
 import { ROUTES } from "./constants";
 import type { RouteConfig } from "./types";
 
+
 // Lazy load page components
 const HomePage = lazy(() => import("../pages/HomePage"));
 const DashboardPage = lazy(() => import("../pages/DashboardPage"));
