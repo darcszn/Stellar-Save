@@ -1448,7 +1448,7 @@ pub fn is_member(
         caller.require_auth();
 
         let group_key = StorageKeyBuilder::group_data(group_id);
-        let group = env
+        let mut group = env
             .storage()
             .persistent()
             .get::<_, Group>(&group_key)
@@ -1472,15 +1472,13 @@ pub fn is_member(
         let new_status = GroupStatus::Paused;
         env.storage().persistent().set(&status_key, &new_status);
 
+        // Update the paused flag on the Group struct
+        group.paused = true;
+        group.status = GroupStatus::Paused;
+        env.storage().persistent().set(&group_key, &group);
+
         let timestamp = env.ledger().timestamp();
-        EventEmitter::emit_group_status_changed(
-            &env,
-            group_id,
-            current_status as u32,
-            new_status as u32,
-            caller,
-            timestamp,
-        );
+        EventEmitter::emit_group_paused(&env, group_id, caller, timestamp);
 
         Ok(())
     }
@@ -1504,7 +1502,7 @@ pub fn is_member(
         caller.require_auth();
 
         let group_key = StorageKeyBuilder::group_data(group_id);
-        let group = env
+        let mut group = env
             .storage()
             .persistent()
             .get::<_, Group>(&group_key)
@@ -1528,17 +1526,21 @@ pub fn is_member(
         let new_status = GroupStatus::Active;
         env.storage().persistent().set(&status_key, &new_status);
 
+        // Update the paused flag on the Group struct
+        group.paused = false;
+        group.status = GroupStatus::Active;
+        env.storage().persistent().set(&group_key, &group);
+
         let timestamp = env.ledger().timestamp();
-        EventEmitter::emit_group_status_changed(
-            &env,
-            group_id,
-            current_status as u32,
-            new_status as u32,
-            caller,
-            timestamp,
-        );
+        EventEmitter::emit_group_unpaused(&env, group_id, caller, timestamp);
 
         Ok(())
+    }
+
+    /// Unpauses a paused group, allowing contributions and payouts again.
+    /// Alias for resume_group with the name matching the issue specification.
+    pub fn unpause_group(env: Env, group_id: u64, caller: Address) -> Result<(), StellarSaveError> {
+        Self::resume_group(env, group_id, caller)
     }
 
     /// Cancels a group and returns funds to contributors.
@@ -2434,6 +2436,73 @@ pub fn is_member(
 
         // Emit event
         EventEmitter::emit_member_joined(&env, group_id, member, group.member_count, timestamp);
+
+        Ok(())
+    }
+
+    /// Records a contribution from a member for the current cycle.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `group_id` - ID of the group to contribute to
+    /// * `member` - Address of the contributing member
+    /// * `amount` - Contribution amount in stroops (must match group's required amount)
+    ///
+    /// # Returns
+    /// * `Ok(())` - Contribution recorded successfully
+    /// * `Err(StellarSaveError)` - If validation fails
+    ///
+    /// # Errors
+    /// - `GroupNotFound` - Group doesn't exist
+    /// - `InvalidState` - Group is paused or not in Active status
+    /// - `NotMember` - Caller is not a member of the group
+    /// - `AlreadyContributed` - Member already contributed this cycle
+    /// - `InvalidAmount` - Amount doesn't match group's required contribution
+    pub fn contribute(
+        env: Env,
+        group_id: u64,
+        member: Address,
+        amount: i128,
+    ) -> Result<(), StellarSaveError> {
+        member.require_auth();
+
+        let group_key = StorageKeyBuilder::group_data(group_id);
+        let group: Group = env
+            .storage()
+            .persistent()
+            .get(&group_key)
+            .ok_or(StellarSaveError::GroupNotFound)?;
+
+        // whenNotPaused: reject if group is paused
+        if group.paused {
+            return Err(StellarSaveError::InvalidState);
+        }
+
+        if group.status != GroupStatus::Active {
+            return Err(StellarSaveError::InvalidState);
+        }
+
+        // Verify caller is a member
+        let member_key = StorageKeyBuilder::member_profile(group_id, member.clone());
+        if !env.storage().persistent().has(&member_key) {
+            return Err(StellarSaveError::NotMember);
+        }
+
+        // Validate contribution amount matches group requirement
+        Self::validate_contribution_amount(&env, group_id, amount)?;
+
+        let timestamp = env.ledger().timestamp();
+        Self::record_contribution(&env, group_id, group.current_cycle, member.clone(), amount, timestamp)?;
+
+        EventEmitter::emit_contribution_made(
+            &env,
+            group_id,
+            member,
+            amount,
+            group.current_cycle,
+            amount, // cycle_total placeholder; actual total tracked in storage
+            timestamp,
+        );
 
         Ok(())
     }
